@@ -72,6 +72,7 @@ static const struct vo_driver *const video_out_drivers[] =
 #if HAVE_ANDROID
     &video_out_mediacodec_embed,
 #endif
+    &video_out_libmpv,
     &video_out_gpu,
     &video_out_gpu_next,
 #if HAVE_VDPAU
@@ -98,7 +99,6 @@ static const struct vo_driver *const video_out_drivers[] =
 #if HAVE_X11
     &video_out_x11,
 #endif
-    &video_out_libmpv,
     &video_out_null,
     // should not be auto-selected
     &video_out_image,
