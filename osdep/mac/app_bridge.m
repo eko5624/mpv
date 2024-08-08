@@ -66,7 +66,6 @@ const struct m_sub_options macos_conf = {
         .macos_menu_shortcuts = true,
         .cocoa_cb_sw_renderer = -1,
         .cocoa_cb_10bit_context = true,
-        .cocoa_cb_output_csp = MAC_CSP_AUTO,
     },
 };
 
