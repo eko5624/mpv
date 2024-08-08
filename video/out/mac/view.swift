@@ -32,7 +32,6 @@ class View: NSView, CALayerDelegate {
         super.init(frame: frame)
         autoresizingMask = [.width, .height]
         wantsBestResolutionOpenGLSurface = true
-        wantsExtendedDynamicRangeOpenGLSurface = true
         registerForDraggedTypes([ .fileURL, .URL, .string ])
     }
 
