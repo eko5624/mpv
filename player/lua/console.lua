@@ -89,6 +89,7 @@ local id = default_id
 local histories = {[id] = {}}
 local history = histories[id]
 local history_pos = 1
+local searching_history = false
 local log_buffers = {[id] = {}}
 local key_bindings = {}
 local global_margins = { t = 0, b = 0 }
@@ -356,9 +357,11 @@ end
 
 local function fuzzy_find(needle, haystacks)
     local result = require 'mp.fzy'.filter(needle, haystacks)
-    table.sort(result, function (i, j)
-        return i[3] > j[3]
-    end)
+    if line ~= '' then -- Prevent table.sort() from reordering the items.
+        table.sort(result, function (i, j)
+            return i[3] > j[3]
+        end)
+    end
     for i, value in ipairs(result) do
         result[i] = value[1]
     end
@@ -638,14 +641,8 @@ local function handle_edit()
         matches = {}
         selected_match = 1
 
-        if line == '' then
-            for i, item in ipairs(selectable_items) do
-                matches[i] = { index = i, text = item }
-            end
-        else
-            for i, match in ipairs(fuzzy_find(line, selectable_items)) do
-                matches[i] = { index = match, text = selectable_items[match] }
-            end
+        for i, match in ipairs(fuzzy_find(line, selectable_items)) do
+            matches[i] = { index = match, text = selectable_items[match] }
         end
     end
 
@@ -769,6 +766,16 @@ end
 
 -- Run the current command and clear the line (Enter)
 local function handle_enter()
+    if searching_history then
+        searching_history = false
+        selectable_items = nil
+        line = #matches > 0 and matches[selected_match].text or ''
+        cursor = #line + 1
+        log_buffers[id] = {}
+        update()
+        return
+    end
+
     if line == '' and input_caller == nil then
         return
     end
@@ -876,6 +883,28 @@ local function handle_pgdown()
     end
 
     go_history(#history + 1)
+end
+
+local function search_history()
+    if selectable_items or #history == 0 then
+        return
+    end
+
+    searching_history = true
+    selectable_items = {}
+    matches = {}
+    selected_match = 1
+    first_match_to_print = 1
+
+    for i = 1, #history do
+        selectable_items[i] = history[#history + 1 - i]
+    end
+
+    for i, match in ipairs(fuzzy_find(line, selectable_items)) do
+        matches[i] = { index = match, text = selectable_items[match] }
+    end
+
+    update()
 end
 
 local function page_up_or_prev_char()
@@ -1532,6 +1561,7 @@ local function get_bindings()
         { 'end',         go_end                                 },
         { 'pgup',        handle_pgup                            },
         { 'pgdwn',       handle_pgdown                          },
+        { 'ctrl+r',      search_history                         },
         { 'ctrl+c',      clear                                  },
         { 'ctrl+d',      maybe_exit                             },
         { 'ctrl+k',      del_to_eol                             },
@@ -1544,6 +1574,10 @@ local function get_bindings()
         { 'ctrl+del',    del_next_word                          },
         { 'alt+d',       del_next_word                          },
         { 'kp_dec',      function() handle_char_input('.') end  },
+        { 'kp_add',      function() handle_char_input('+') end  },
+        { 'kp_subtract', function() handle_char_input('-') end  },
+        { 'kp_multiply', function() handle_char_input('*') end  },
+        { 'kp_divide',   function() handle_char_input('/') end  },
     }
 
     for i = 0, 9 do
@@ -1591,6 +1625,12 @@ set_active = function (active)
             history_pos = #history + 1
             mp.enable_messages('terminal-default')
         end
+    elseif searching_history then
+        searching_history = false
+        line = ''
+        cursor = 1
+        selectable_items = nil
+        log_buffers[id] = {}
     else
         repl_active = false
         suggestion_buffer = {}

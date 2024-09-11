@@ -66,6 +66,11 @@
 #define WAYLAND_SCALE_FACTOR 120.0
 
 
+enum resizing_constraint {
+    MP_WIDTH_CONSTRAINT = 1,
+    MP_HEIGHT_CONSTRAINT = 2,
+};
+
 static const struct mp_keymap keymap[] = {
     /* Special keys */
     {XKB_KEY_Pause,     MP_KEY_PAUSE}, {XKB_KEY_Escape,       MP_KEY_ESC},
@@ -97,8 +102,8 @@ static const struct mp_keymap keymap[] = {
     {XKB_KEY_F23, MP_KEY_F +23},  {XKB_KEY_F24, MP_KEY_F +24},
 
     /* Numpad independent of numlock */
-    {XKB_KEY_KP_Subtract, '-'}, {XKB_KEY_KP_Add,    '+'},
-    {XKB_KEY_KP_Multiply, '*'}, {XKB_KEY_KP_Divide, '/'},
+    {XKB_KEY_KP_Subtract, MP_KEY_KPSUBTRACT}, {XKB_KEY_KP_Add,    MP_KEY_KPADD},
+    {XKB_KEY_KP_Multiply, MP_KEY_KPMULTIPLY}, {XKB_KEY_KP_Divide, MP_KEY_KPDIVIDE},
     {XKB_KEY_KP_Enter, MP_KEY_KPENTER},
 
     /* Numpad with numlock */
@@ -204,7 +209,7 @@ static void add_feedback(struct vo_wayland_feedback_pool *fback_pool,
 static void apply_keepaspect(struct vo_wayland_state *wl, int *width, int *height);
 static void get_shape_device(struct vo_wayland_state *wl, struct vo_wayland_seat *s);
 static void guess_focus(struct vo_wayland_state *wl);
-static void handle_key_input(struct vo_wayland_seat *s, uint32_t key, uint32_t state);
+static void handle_key_input(struct vo_wayland_seat *s, uint32_t key, uint32_t state, bool no_emit);
 static void prepare_resize(struct vo_wayland_state *wl);
 static void remove_feedback(struct vo_wayland_feedback_pool *fback_pool,
                             struct wp_presentation_feedback *fback);
@@ -294,9 +299,6 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
         button = 0;
     }
 
-    if (button)
-        mp_input_put_key(wl->vo->input_ctx, button | state | s->mpmod);
-
     enum xdg_toplevel_resize_edge edges;
     if (!mp_input_test_dragging(wl->vo->input_ctx, wl->mouse_x, wl->mouse_y) &&
         !wl->locked_size && (button == MP_MBTN_LEFT) && (state == MP_KEY_STATE_DOWN) &&
@@ -304,8 +306,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     {
         // Implement an edge resize zone if there are no decorations
         xdg_toplevel_resize(wl->xdg_toplevel, s->seat, serial, edges);
-        // Explicitly send an UP event after the client finishes a resize
-        mp_input_put_key(wl->vo->input_ctx, button | MP_KEY_STATE_UP);
+        return;
     } else if (state == MP_KEY_STATE_DOWN) {
         // Save the serial and seat for voctrl-initialized dragging requests.
         s->pointer_button_serial = serial;
@@ -313,6 +314,9 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     } else {
         wl->last_button_seat = NULL;
     }
+
+    if (button)
+        mp_input_put_key(wl->vo->input_ctx, button | state | s->mpmod);
 }
 
 static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
@@ -417,18 +421,19 @@ static void touch_handle_down(void *data, struct wl_touch *wl_touch,
     wl->mouse_x = handle_round(wl->scaling, wl_fixed_to_int(x_w));
     wl->mouse_y = handle_round(wl->scaling, wl_fixed_to_int(y_w));
 
-    mp_input_add_touch_point(wl->vo->input_ctx, id, wl->mouse_x, wl->mouse_y);
-
     enum xdg_toplevel_resize_edge edge;
     if (!mp_input_test_dragging(wl->vo->input_ctx, wl->mouse_x, wl->mouse_y) &&
         !wl->locked_size && check_for_resize(wl, wl->opts->wl_edge_pixels_touch, &edge))
     {
         xdg_toplevel_resize(wl->xdg_toplevel, s->seat, serial, edge);
+        return;
     } else {
         // Save the serial and seat for voctrl-initialized dragging requests.
         s->pointer_button_serial = serial;
         wl->last_button_seat = s;
     }
+
+    mp_input_add_touch_point(wl->vo->input_ctx, id, wl->mouse_x, wl->mouse_y);
 }
 
 static void touch_handle_up(void *data, struct wl_touch *wl_touch,
@@ -557,7 +562,7 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
                                 uint32_t state)
 {
     struct vo_wayland_seat *s = data;
-    handle_key_input(s, key, state);
+    handle_key_input(s, key, state, false);
 }
 
 static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboard,
@@ -576,8 +581,11 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboar
     // Handle keys pressed during the enter event.
     if (s->keyboard_entering) {
         s->keyboard_entering = false;
-        for (int n = 0; n < s->num_keyboard_entering_keys; n++)
-            handle_key_input(s, s->keyboard_entering_keys[n], WL_KEYBOARD_KEY_STATE_PRESSED);
+        // Only handle entering keys if only one key is pressed since
+        // Wayland doesn't guarantee that these keys are in order.
+        if (s->num_keyboard_entering_keys == 1)
+            for (int n = 0; n < s->num_keyboard_entering_keys; n++)
+                handle_key_input(s, s->keyboard_entering_keys[n], WL_KEYBOARD_KEY_STATE_PRESSED, true);
         s->num_keyboard_entering_keys = 0;
     } else if (s->xkb_state && s->mpkey) {
         mp_input_put_key(wl->vo->input_ctx, s->mpkey | MP_KEY_STATE_DOWN | s->mpmod);
@@ -652,9 +660,7 @@ static void data_offer_handle_offer(void *data, struct wl_data_offer *offer,
     int score = mp_event_get_mime_type_score(wl->vo->input_ctx, mime_type);
     if (score > wl->dnd_mime_score && wl->opts->drag_and_drop != -2) {
         wl->dnd_mime_score = score;
-        if (wl->dnd_mime_type)
-            talloc_free(wl->dnd_mime_type);
-        wl->dnd_mime_type = talloc_strdup(wl, mime_type);
+        talloc_replace(wl, wl->dnd_mime_type, mime_type);
         MP_VERBOSE(wl, "Given DND offer with mime type %s\n", wl->dnd_mime_type);
     }
 }
@@ -1037,6 +1043,7 @@ static void handle_toplevel_config(void *data, struct xdg_toplevel *toplevel,
     bool is_maximized = false;
     bool is_fullscreen = false;
     bool is_activated = false;
+    bool is_resizing = false;
     bool is_suspended = false;
     bool is_tiled = false;
     enum xdg_toplevel_state *state;
@@ -1046,6 +1053,7 @@ static void handle_toplevel_config(void *data, struct xdg_toplevel *toplevel,
             is_fullscreen = true;
             break;
         case XDG_TOPLEVEL_STATE_RESIZING:
+            is_resizing = true;
             break;
         case XDG_TOPLEVEL_STATE_ACTIVATED:
             is_activated = true;
@@ -1075,6 +1083,11 @@ static void handle_toplevel_config(void *data, struct xdg_toplevel *toplevel,
 
     if (wl->hidden != is_suspended)
         wl->hidden = is_suspended;
+
+    if (wl->resizing != is_resizing) {
+        wl->resizing = is_resizing;
+        wl->resizing_constraint = 0;
+    }
 
     if (opts->fullscreen != is_fullscreen) {
         wl->state_change = wl->reconfigured;
@@ -1552,10 +1565,39 @@ static void apply_keepaspect(struct vo_wayland_state *wl, int *width, int *heigh
     if (!wl->opts->keepaspect)
         return;
 
+    int phys_width = handle_round(wl->scaling, *width);
+    int phys_height = handle_round(wl->scaling, *height);
+
+    // Ensure that the size actually changes before we start trying to actually
+    // calculate anything so the wrong constraint for the rezie isn't choosen.
+    if (wl->resizing && !wl->resizing_constraint &&
+        phys_width == mp_rect_w(wl->geometry) && phys_height == mp_rect_h(wl->geometry))
+        return;
+
+    // We are doing a continuous resize (e.g. dragging with mouse), constrain the
+    // aspect ratio against the height if the change is only in the height
+    // coordinate.
+    if (wl->resizing && !wl->resizing_constraint && phys_width == mp_rect_w(wl->geometry) &&
+        phys_height != mp_rect_h(wl->geometry)) {
+        wl->resizing_constraint = MP_HEIGHT_CONSTRAINT;
+    } else if (!wl->resizing_constraint) {
+        wl->resizing_constraint = MP_WIDTH_CONSTRAINT;
+    }
+
+    if (wl->resizing_constraint == MP_HEIGHT_CONSTRAINT) {
+        MPSWAP(int, *width, *height);
+        MPSWAP(int, wl->reduced_width, wl->reduced_height);
+    }
+
     double scale_factor = (double)*width / wl->reduced_width;
     *width = ceil(wl->reduced_width * scale_factor);
     if (wl->opts->keepaspect_window)
         *height = ceil(wl->reduced_height * scale_factor);
+
+    if (wl->resizing_constraint == MP_HEIGHT_CONSTRAINT) {
+        MPSWAP(int, *width, *height);
+        MPSWAP(int, wl->reduced_width, wl->reduced_height);
+    }
 }
 
 static void free_dnd_data(struct vo_wayland_state *wl)
@@ -1850,7 +1892,7 @@ static int lookupkey(int key)
 }
 
 static void handle_key_input(struct vo_wayland_seat *s, uint32_t key,
-                             uint32_t state)
+                             uint32_t state, bool no_emit)
 {
     struct vo_wayland_state *wl = s->wl;
 
@@ -1864,6 +1906,9 @@ static void handle_key_input(struct vo_wayland_seat *s, uint32_t key,
     default:
         return;
     }
+
+    if (no_emit)
+        state = state | MP_KEY_STATE_SET_ONLY;
 
     s->keyboard_code = key + 8;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(s->xkb_state, s->keyboard_code);
@@ -1879,16 +1924,16 @@ static void handle_key_input(struct vo_wayland_seat *s, uint32_t key,
             // Assume a modifier was pressed and handle it in the mod event instead.
             // If a modifier is released before a regular key, also release that
             // key to not activate it again by accident.
-            if (state == MP_KEY_STATE_UP) {
+            if (state & MP_KEY_STATE_UP) {
                 s->mpkey = 0;
                 mp_input_put_key(wl->vo->input_ctx, MP_INPUT_RELEASE_ALL);
             }
             return;
         }
     }
-    if (state == MP_KEY_STATE_DOWN)
+    if (state & MP_KEY_STATE_DOWN)
         s->mpkey = mpkey;
-    if (mpkey && state == MP_KEY_STATE_UP)
+    if (mpkey && (state & MP_KEY_STATE_UP))
         s->mpkey = 0;
 }
 

@@ -598,7 +598,8 @@ static void interpret_key(struct input_ctx *ictx, int code, double scale,
                           int scale_units)
 {
     int state = code & (MP_KEY_STATE_DOWN | MP_KEY_STATE_UP);
-    code = code & ~(unsigned)state;
+    bool no_emit = code & MP_KEY_STATE_SET_ONLY;
+    code = code & ~(unsigned)(state | MP_KEY_STATE_SET_ONLY);
 
     if (mp_msg_test(ictx->log, MSGL_TRACE)) {
         char *key = mp_input_get_key_name(code);
@@ -648,9 +649,10 @@ static void interpret_key(struct input_ctx *ictx, int code, double scale,
         return;
 
     // Don't emit a command on key-down if the key is designed to emit commands
-    // on key-up (like mouse buttons). Also, if the command specifically should
-    // be sent both on key down and key up, still emit the command.
-    if (cmd->emit_on_up && !cmd->def->on_updown) {
+    // on key-up (like mouse buttons), or setting key state only without emitting commands.
+    // Also, if the command specifically should be sent both on key down and key up,
+    // still emit the command.
+    if ((cmd->emit_on_up && !cmd->def->on_updown) || no_emit) {
         talloc_free(cmd);
         return;
     }
@@ -1302,8 +1304,7 @@ void mp_input_define_section(struct input_ctx *ictx, char *name, char *location,
     if ((!bs->owner || (owner && strcmp(bs->owner, owner) != 0)) &&
         !bstr_equals0(bs->section, "default"))
     {
-        talloc_free(bs->owner);
-        bs->owner = talloc_strdup(bs, owner);
+        talloc_replace(bs, bs->owner, owner);
     }
     remove_binds(bs, builtin);
     if (contents && contents[0]) {
@@ -1720,7 +1721,7 @@ struct mpv_node mp_input_get_bindings(struct input_ctx *ictx)
             if (b_priority >= 0 && !b->is_builtin)
                 b_priority += ictx->num_active_sections;
 
-            node_map_add_string(entry, "section", s->section.start);
+            node_map_add_bstr(entry, "section", s->section);
             if (s->owner)
                 node_map_add_string(entry, "owner", s->owner);
             node_map_add_string(entry, "cmd", b->cmd);
